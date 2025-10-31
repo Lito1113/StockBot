@@ -1,8 +1,8 @@
 # -----------------------------
-# Hotlist AI — Mobile (Auto-Discover Edition)
-# Finds the 15 most-talked tickers on Reddit (last 2 market days) via Pushshift,
-# runs VADER sentiment, validates symbols with Yahoo Finance, enriches with
-# RSI/SMA/Volume, and ranks them. No Reddit credentials required.
+# Hotlist AI — Mobile (Auto-Discover + Resilient Pushshift Fallback)
+# Finds the 15 most-talked tickers on Reddit over a recent window,
+# runs VADER sentiment, validates symbols via Yahoo Finance,
+# enriches with RSI/SMA/Volume, and ranks them.
 # -----------------------------
 
 import re, time, datetime as dt
@@ -28,20 +28,25 @@ except LookupError:
 
 # ------- Defaults -------
 DEFAULT_SUBREDDITS = ["stocks", "pennystocks", "themadinvestor", "TheRaceTo10Million"]
-TICKER_PATTERN = re.compile(r"\b[A-Z]{2,5}\b")
-PULLPUSH_BASE = "https://api.pullpush.io/reddit/search"
 
-# Small stopword list to avoid false "tickers"
+# Looks-like-a-ticker heuristic (2–5 uppercase letters)
+TICKER_PATTERN = re.compile(r"\b[A-Z]{2,5}\b")
+
+# Primary + fallback endpoints
+PRIMARY_BASE = "https://api.pullpush.io/reddit/search"
+FALLBACK_BASE = "https://api.pushshift.io/reddit/search"
+
+# Small stopword list to avoid obvious non-tickers
 STOP_TICKER_WORDS = {
     "USD","CEO","DD","ATH","IPO","ETF","AI","YOLO","OTC","TOS","API",
     "GDP","CPI","FOMC","SEC","DTCC","RSI","SMA","EMA","EPS","PE","PEG"
 }
 
-# -------------------- Helpers --------------------
+# -------------------- Time window helpers --------------------
 def last_two_market_days_start_ts(tz: str = "US/Eastern") -> int:
     """
-    Unix timestamp at 00:00 of the EARLIER of the last two business days
-    (Mon–Fri only; simple holiday-agnostic). Used as 'after' filter for Reddit scan.
+    Unix timestamp at 00:00 of the EARLIER of the last two business days.
+    (Mon–Fri; simple holiday-agnostic.)
     """
     now_local = pd.Timestamp.now(tz).normalize()
     found = 0
@@ -56,6 +61,11 @@ def last_two_market_days_start_ts(tz: str = "US/Eastern") -> int:
     # convert to UTC epoch seconds
     return int(start_candidate.tz_convert("UTC").timestamp())
 
+def five_day_window_start_ts() -> int:
+    """Unix ts for ~5 calendar days ago (UTC)."""
+    return int((pd.Timestamp.utcnow() - pd.Timedelta(days=5)).timestamp())
+
+# -------------------- Extraction helpers --------------------
 def clean_whitelist(raw: str) -> List[str]:
     return sorted({t.strip().upper() for t in re.split(r"[,\s]+", raw) if t.strip()})
 
@@ -67,6 +77,7 @@ def extract_tickers(text: str, whitelist: Optional[List[str]]):
         return [t for t in found if t not in STOP_TICKER_WORDS and 2 <= len(t) <= 5]
     return [t for t in found if t in whitelist]
 
+# -------------------- HTTP + Pushshift wrappers --------------------
 def http_get(url, params, timeout=20, retries=2, backoff=0.8):
     """GET with retries/backoff, returning JSON or None."""
     for i in range(retries + 1):
@@ -79,11 +90,30 @@ def http_get(url, params, timeout=20, retries=2, backoff=0.8):
         time.sleep(backoff * (i + 1))
     return None
 
+def pp_fetch(kind: str, params: dict):
+    """
+    Try PRIMARY (PullPush). If empty or error, try FALLBACK (api.pushshift.io).
+    Returns list of items (dicts).
+    """
+    # Primary
+    j = http_get(f"{PRIMARY_BASE}/{kind}", params)
+    data = (j or {}).get("data") if isinstance(j, dict) else None
+    if isinstance(data, list) and len(data) > 0:
+        return data
+
+    # Fallback
+    j2 = http_get(f"{FALLBACK_BASE}/{kind}", params)
+    data2 = (j2 or {}).get("data") if isinstance(j2, dict) else None
+    if isinstance(data2, list):
+        return data2
+
+    return []
+
 @st.cache_data(ttl=900)
 def pullpush_fetch_sub(subreddit: str, limit_total: int = 150, after_ts: Optional[int] = None):
     """
-    Fetch recent submissions + comments text for a subreddit via PullPush.
-    Returns list[str] of text blobs.
+    Fetch recent submissions + comments text for a subreddit via Pushshift-like APIs.
+    Returns list[str] of text blobs. Uses primary mirror with fallback automatically.
     """
     texts = []
     base_params = {
@@ -97,30 +127,29 @@ def pullpush_fetch_sub(subreddit: str, limit_total: int = 150, after_ts: Optiona
 
     # Submissions (titles + bodies)
     params1 = {**base_params, "is_video": "false"}
-    res1 = http_get(f"{PULLPUSH_BASE}/submission", params1)
-    if res1 and isinstance(res1.get("data"), list):
-        for s in res1["data"]:
-            title = s.get("title") or ""
-            body = s.get("selftext") or ""
-            if title or body:
-                texts.append(f"{title}\n{body}")
+    subs = pp_fetch("submission", params1)
+    for s in subs:
+        title = s.get("title") or ""
+        body  = s.get("selftext") or ""
+        if title or body:
+            texts.append(f"{title}\n{body}")
 
-    # Comments (grab up to remaining)
+    # Comments (up to the remaining amount)
     remain = max(0, limit_total - len(texts))
     if remain:
         params2 = {**base_params, "size": min(100, remain)}
-        res2 = http_get(f"{PULLPUSH_BASE}/comment", params2)
-        if res2 and isinstance(res2.get("data"), list):
-            for c in res2["data"]:
-                body = c.get("body") or ""
-                if body:
-                    texts.append(body)
+        coms = pp_fetch("comment", params2)
+        for c in coms:
+            body = c.get("body") or ""
+            if body:
+                texts.append(body)
 
     return texts
 
+# -------------------- Scan + selection --------------------
 @st.cache_data(ttl=900)
 def scan_pushshift(subreddits, limit_per_sub, whitelist, after_ts=None):
-    """Mentions & sentiment by ticker using PullPush over an optional time window."""
+    """Mentions & sentiment by ticker using Pushshift over an optional time window."""
     sid = SentimentIntensityAnalyzer()
     rows = []
 
@@ -129,7 +158,7 @@ def scan_pushshift(subreddits, limit_per_sub, whitelist, after_ts=None):
     for idx, sub in enumerate(subreddits, start=1):
         texts = pullpush_fetch_sub(sub, limit_total=limit_per_sub, after_ts=after_ts)
         if not texts:
-            st.info(f"Skipping r/{sub} (no data returned from PullPush)")
+            st.info(f"Skipping r/{sub} (no data returned from Pushshift)")
         else:
             for t in texts:
                 tickers = extract_tickers(t, whitelist)
@@ -179,6 +208,7 @@ def keep_top15_valid(sent_df: pd.DataFrame) -> pd.DataFrame:
             break
     return sent_df[sent_df["ticker"].isin(picked)].copy()
 
+# -------------------- Market enrichment --------------------
 def fetch_market_block(ticker, lookback_days=220, retries=1):
     """RSI/SMA/volume snapshot with small retry."""
     data = None
@@ -200,7 +230,7 @@ def fetch_market_block(ticker, lookback_days=220, retries=1):
         return None
 
     close = data["Close"]
-    vol = data["Volume"]
+    vol   = data["Volume"]
 
     sma20  = close.rolling(20).mean()
     sma50  = close.rolling(50).mean()
@@ -208,15 +238,15 @@ def fetch_market_block(ticker, lookback_days=220, retries=1):
 
     # RSI(14)
     delta = close.diff()
-    gain = (delta.clip(lower=0)).rolling(14).mean()
-    loss = (-delta.clip(upper=0)).rolling(14).mean()
-    rs = gain / loss
-    rsi = 100 - (100 / (1 + rs))
+    gain  = (delta.clip(lower=0)).rolling(14).mean()
+    loss  = (-delta.clip(upper=0)).rolling(14).mean()
+    rs    = gain / loss
+    rsi   = 100 - (100 / (1 + rs))
 
     vol20 = vol.rolling(20).mean()
     last = data.iloc[-1]
     last_close = float(last["Close"])
-    last_vol = float(last["Volume"])
+    last_vol   = float(last["Volume"])
 
     return {
         "price": last_close,
@@ -259,6 +289,7 @@ def enrich_with_market(sent_df: pd.DataFrame, top_n: int = 25) -> pd.DataFrame:
     merged = pd.merge(sent_df, mdf, on="ticker", how="left", validate="1:1")
     return merged
 
+# -------------------- Scoring + classification --------------------
 def composite_score(row):
     comp = 0.0
     # sentiment (-1..1) -> 0..1
@@ -302,7 +333,7 @@ def ai_decision(zone, sentiment_compound):
 # -------------------- UI --------------------
 st.set_page_config(page_title="Hotlist AI — Mobile", page_icon="📈", layout="wide")
 st.title("📈 Hotlist AI — Mobile")
-st.caption("Auto-discovers top 15 tickers from Reddit (last 2 market days) + sentiment + technicals. No Reddit login needed.")
+st.caption("Auto-discovers top 15 tickers from Reddit with Pushshift (with fallback), then adds sentiment + technicals. No Reddit login needed.")
 
 with st.sidebar:
     st.header("Settings")
@@ -314,31 +345,25 @@ with st.sidebar:
     )
     subreddits = [s.strip() for s in re.split(r"[,\s]+", subs_raw) if s.strip()]
 
-    auto_discover = st.toggle("Auto-discover top 15 from last 2 market days", value=True)
+    auto_discover = st.toggle("Auto-discover top 15 (recent window)", value=True)
 
     limit_per = st.slider("Items per subreddit (posts + comments)", 50, 500, 150, step=25)
 
-    # Whitelist only used when auto-discover is OFF
-    whitelist = None
-    if not auto_discover:
-        wl_text = st.text_area(
-            "Ticker whitelist (comma or space separated)",
-            value="AAPL, MSFT, NVDA, TSLA, GOOGL, AMZN",
-            height=120,
-        )
-        whitelist = clean_whitelist(wl_text)
-
-    top_n = 25  # enrich more than we keep, to ensure coverage
-
     st.write("---")
-    st.write("Data source: PullPush (Pushshift mirror). Market data: Yahoo Finance.")
+    st.write("Data source: PullPush → fallback to Pushshift. Market data: Yahoo Finance.")
 
-# Step 1: Social scan (time window when auto-discover is ON)
-st.subheader("Step 1 · Reddit-like scan (PullPush)")
+# -------- Step 1: Social scan with resilient window/fallback --------
+st.subheader("Step 1 · Reddit-like scan (Pushshift w/ fallback)")
 after_ts = last_two_market_days_start_ts() if auto_discover else None
-sent_df = scan_pushshift(subreddits, limit_per, whitelist, after_ts=after_ts)
+sent_df = scan_pushshift(subreddits, limit_per, whitelist=None, after_ts=after_ts)
 
-# Auto-discover flow: validate via Yahoo and keep exactly 15
+# If still empty, broaden to ~5 days and try again (once)
+if sent_df.empty and auto_discover:
+    st.info("No data found in last 2 market days. Broadening window to ~5 days…")
+    after_ts_wide = five_day_window_start_ts()
+    sent_df = scan_pushshift(subreddits, limit_per, whitelist=None, after_ts=after_ts_wide)
+
+# Keep only top 15 valid tickers (Yahoo validated)
 if auto_discover and not sent_df.empty:
     sent_df = keep_top15_valid(sent_df)
 
@@ -346,13 +371,13 @@ st.dataframe(sent_df, use_container_width=True)
 if sent_df.empty:
     st.stop()
 
-# Step 2: Market enrichment
+# -------- Step 2: Market enrichment --------
 st.subheader("Step 2 · Market enrichment")
-full = enrich_with_market(sent_df, top_n=top_n)
+full = enrich_with_market(sent_df, top_n=25)  # enrich a bit more than 15
 if full.empty:
     st.stop()
 
-# Step 3: Scoring + classifications
+# -------- Step 3: Scoring + ranked output --------
 full["Composite"] = full.apply(composite_score, axis=1)
 full["BuyZone"] = full.apply(classify_zone, axis=1)
 full["AI_Decision"] = [ai_decision(z, c) for z, c in zip(full["BuyZone"], full["compound"].fillna(0.0))]
