@@ -1,8 +1,8 @@
 # -----------------------------
-# Hotlist AI — Mobile (Auto-Discover + Resilient Pushshift Fallback)
+# Hotlist AI — Mobile (Auto-Discover + Triple Fallback)
 # Finds the 15 most-talked tickers on Reddit over a recent window,
-# runs VADER sentiment, validates symbols via Yahoo Finance,
-# enriches with RSI/SMA/Volume, and ranks them.
+# runs VADER sentiment, validates via Yahoo, enriches with RSI/SMA/Volume, and ranks them.
+# Data sources (in order): PullPush -> Pushshift -> Reddit public JSON (no login).
 # -----------------------------
 
 import re, time, datetime as dt
@@ -33,8 +33,13 @@ DEFAULT_SUBREDDITS = ["stocks", "pennystocks", "themadinvestor", "TheRaceTo10Mil
 TICKER_PATTERN = re.compile(r"\b[A-Z]{2,5}\b")
 
 # Primary + fallback endpoints
-PRIMARY_BASE = "https://api.pullpush.io/reddit/search"
+PRIMARY_BASE  = "https://api.pullpush.io/reddit/search"
 FALLBACK_BASE = "https://api.pushshift.io/reddit/search"
+
+# Public Reddit JSON (no auth) requires a real UA
+REDDIT_HEADERS = {
+    "User-Agent": "web:stockbot:v1.0 (by /u/Lito_1113)"
+}
 
 # Small stopword list to avoid obvious non-tickers
 STOP_TICKER_WORDS = {
@@ -44,10 +49,7 @@ STOP_TICKER_WORDS = {
 
 # -------------------- Time window helpers --------------------
 def last_two_market_days_start_ts(tz: str = "US/Eastern") -> int:
-    """
-    Unix timestamp at 00:00 of the EARLIER of the last two business days.
-    (Mon–Fri; simple holiday-agnostic.)
-    """
+    """Unix timestamp at 00:00 of the EARLIER of the last two business days (Mon–Fri)."""
     now_local = pd.Timestamp.now(tz).normalize()
     found = 0
     day = 0
@@ -58,7 +60,6 @@ def last_two_market_days_start_ts(tz: str = "US/Eastern") -> int:
             start_candidate = d
             found += 1
         day += 1
-    # convert to UTC epoch seconds
     return int(start_candidate.tz_convert("UTC").timestamp())
 
 def five_day_window_start_ts() -> int:
@@ -77,14 +78,17 @@ def extract_tickers(text: str, whitelist: Optional[List[str]]):
         return [t for t in found if t not in STOP_TICKER_WORDS and 2 <= len(t) <= 5]
     return [t for t in found if t in whitelist]
 
-# -------------------- HTTP + Pushshift wrappers --------------------
-def http_get(url, params, timeout=20, retries=2, backoff=0.8):
+# -------------------- HTTP + source wrappers --------------------
+def http_get(url, params=None, headers=None, timeout=20, retries=2, backoff=0.8):
     """GET with retries/backoff, returning JSON or None."""
     for i in range(retries + 1):
         try:
-            r = requests.get(url, params=params, timeout=timeout)
+            r = requests.get(url, params=params, headers=headers, timeout=timeout)
             if r.status_code == 200:
-                return r.json()
+                try:
+                    return r.json()
+                except Exception:
+                    return None
         except Exception:
             pass
         time.sleep(backoff * (i + 1))
@@ -96,26 +100,47 @@ def pp_fetch(kind: str, params: dict):
     Returns list of items (dicts).
     """
     # Primary
-    j = http_get(f"{PRIMARY_BASE}/{kind}", params)
+    j = http_get(f"{PRIMARY_BASE}/{kind}", params=params)
     data = (j or {}).get("data") if isinstance(j, dict) else None
     if isinstance(data, list) and len(data) > 0:
         return data
 
     # Fallback
-    j2 = http_get(f"{FALLBACK_BASE}/{kind}", params)
+    j2 = http_get(f"{FALLBACK_BASE}/{kind}", params=params)
     data2 = (j2 or {}).get("data") if isinstance(j2, dict) else None
-    if isinstance(data2, list):
+    if isinstance(data2, list) and len(data2) > 0:
         return data2
 
     return []
 
+def reddit_json_fetch(subreddit: str, limit: int = 100) -> List[str]:
+    """
+    Final fallback: use Reddit's public JSON (new + hot).
+    No comments (to avoid many requests). Returns list[str] of 'title\\nselftext'.
+    """
+    texts: List[str] = []
+    for feed in ("new", "hot"):
+        url = f"https://www.reddit.com/r/{subreddit}/{feed}.json"
+        j = http_get(url, params={"limit": min(100, max(1, limit))}, headers=REDDIT_HEADERS, timeout=15, retries=1)
+        children = (((j or {}).get("data") or {}).get("children")) if isinstance(j, dict) else None
+        if isinstance(children, list):
+            for c in children:
+                d = (c or {}).get("data") or {}
+                title = d.get("title") or ""
+                body  = d.get("selftext") or ""
+                if title or body:
+                    texts.append(f"{title}\n{body}")
+        time.sleep(0.2)  # be polite
+    return texts
+
 @st.cache_data(ttl=900)
-def pullpush_fetch_sub(subreddit: str, limit_total: int = 150, after_ts: Optional[int] = None):
+def fetch_texts_for_subreddit(subreddit: str, limit_total: int = 150, after_ts: Optional[int] = None) -> List[str]:
     """
-    Fetch recent submissions + comments text for a subreddit via Pushshift-like APIs.
-    Returns list[str] of text blobs. Uses primary mirror with fallback automatically.
+    Try PullPush -> Pushshift (submissions+comments), else fall back to Reddit public JSON.
     """
-    texts = []
+    texts: List[str] = []
+
+    # Use pushshift-like sources first (submissions + comments)
     base_params = {
         "subreddit": subreddit,
         "size": min(100, max(1, limit_total)),
@@ -125,40 +150,42 @@ def pullpush_fetch_sub(subreddit: str, limit_total: int = 150, after_ts: Optiona
     if after_ts:
         base_params["after"] = after_ts
 
-    # Submissions (titles + bodies)
-    params1 = {**base_params, "is_video": "false"}
-    subs = pp_fetch("submission", params1)
+    # Submissions
+    subs = pp_fetch("submission", {**base_params, "is_video": "false"})
     for s in subs:
         title = s.get("title") or ""
         body  = s.get("selftext") or ""
         if title or body:
             texts.append(f"{title}\n{body}")
 
-    # Comments (up to the remaining amount)
+    # Comments up to remaining
     remain = max(0, limit_total - len(texts))
     if remain:
-        params2 = {**base_params, "size": min(100, remain)}
-        coms = pp_fetch("comment", params2)
+        coms = pp_fetch("comment", {**base_params, "size": min(100, remain)})
         for c in coms:
             body = c.get("body") or ""
             if body:
                 texts.append(body)
 
+    # If still empty, use Reddit JSON fallback (new + hot)
+    if not texts:
+        texts = reddit_json_fetch(subreddit, limit=min(100, limit_total))
+
     return texts
 
 # -------------------- Scan + selection --------------------
 @st.cache_data(ttl=900)
-def scan_pushshift(subreddits, limit_per_sub, whitelist, after_ts=None):
-    """Mentions & sentiment by ticker using Pushshift over an optional time window."""
+def scan_sources(subreddits, limit_per_sub, whitelist, after_ts=None):
+    """Mentions & sentiment by ticker over an optional time window using 3-tier sources."""
     sid = SentimentIntensityAnalyzer()
     rows = []
 
     progress = st.progress(0)
     total = max(1, len(subreddits))
     for idx, sub in enumerate(subreddits, start=1):
-        texts = pullpush_fetch_sub(sub, limit_total=limit_per_sub, after_ts=after_ts)
+        texts = fetch_texts_for_subreddit(sub, limit_total=limit_per_sub, after_ts=after_ts)
         if not texts:
-            st.info(f"Skipping r/{sub} (no data returned from Pushshift)")
+            st.info(f"Skipping r/{sub} (no data returned from any source)")
         else:
             for t in texts:
                 tickers = extract_tickers(t, whitelist)
@@ -292,30 +319,32 @@ def enrich_with_market(sent_df: pd.DataFrame, top_n: int = 25) -> pd.DataFrame:
 # -------------------- Scoring + classification --------------------
 def composite_score(row):
     comp = 0.0
-    # sentiment (-1..1) -> 0..1
-    s = (row.get("compound", 0) + 1) / 2
+    s = (row.get("compound", 0) + 1) / 2            # sentiment (-1..1) -> 0..1
     comp += 0.35 * s
-    # momentum: RSI closeness to 50
-    rsi = row.get("rsi", np.nan)
+
+    rsi = row.get("rsi", np.nan)                    # momentum: RSI closeness to 50
     if not np.isnan(rsi):
         comp += 0.30 * (1 - min(abs(rsi - 50), 50) / 50.0)
-    # trend: price near SMA50
-    price, sma50 = row.get("price", np.nan), row.get("sma50", np.nan)
+
+    price, sma50 = row.get("price", np.nan), row.get("sma50", np.nan)  # trend: near SMA50
     if not (np.isnan(price) or np.isnan(sma50) or sma50 == 0):
         dist = abs(price - sma50) / sma50
         comp += 0.20 * (1 - min(dist, 0.5) / 0.5)
-    # volume spike (cap 3x)
-    vs = row.get("vol_spike", np.nan)
+
+    vs = row.get("vol_spike", np.nan)               # volume spike (cap 3x)
     if not np.isnan(vs):
         comp += 0.15 * min(max(vs, 0), 3) / 3.0
+
     return round(float(comp), 4)
 
 def classify_zone(row):
     rsi = row.get("rsi", np.nan)
     price, sma20 = row.get("price", np.nan), row.get("sma20", np.nan)
+
     near_20 = False
     if not (np.isnan(price) or np.isnan(sma20) or sma20 == 0):
         near_20 = abs(price - sma20) / sma20 <= 0.02  # within 2%
+
     if not np.isnan(rsi):
         if 45 <= rsi <= 60 and near_20:
             return "prime"
@@ -333,7 +362,7 @@ def ai_decision(zone, sentiment_compound):
 # -------------------- UI --------------------
 st.set_page_config(page_title="Hotlist AI — Mobile", page_icon="📈", layout="wide")
 st.title("📈 Hotlist AI — Mobile")
-st.caption("Auto-discovers top 15 tickers from Reddit with Pushshift (with fallback), then adds sentiment + technicals. No Reddit login needed.")
+st.caption("Auto-discovers top 15 tickers from Reddit with triple fallback (PullPush → Pushshift → Reddit JSON), then adds sentiment + technicals. No login needed.")
 
 with st.sidebar:
     st.header("Settings")
@@ -350,18 +379,18 @@ with st.sidebar:
     limit_per = st.slider("Items per subreddit (posts + comments)", 50, 500, 150, step=25)
 
     st.write("---")
-    st.write("Data source: PullPush → fallback to Pushshift. Market data: Yahoo Finance.")
+    st.write("Data sources: PullPush → Pushshift → Reddit JSON. Market: Yahoo Finance.")
 
 # -------- Step 1: Social scan with resilient window/fallback --------
-st.subheader("Step 1 · Reddit-like scan (Pushshift w/ fallback)")
+st.subheader("Step 1 · Reddit-like scan (with fallbacks)")
 after_ts = last_two_market_days_start_ts() if auto_discover else None
-sent_df = scan_pushshift(subreddits, limit_per, whitelist=None, after_ts=after_ts)
+sent_df = scan_sources(subreddits, limit_per, whitelist=None, after_ts=after_ts)
 
 # If still empty, broaden to ~5 days and try again (once)
 if sent_df.empty and auto_discover:
     st.info("No data found in last 2 market days. Broadening window to ~5 days…")
     after_ts_wide = five_day_window_start_ts()
-    sent_df = scan_pushshift(subreddits, limit_per, whitelist=None, after_ts=after_ts_wide)
+    sent_df = scan_sources(subreddits, limit_per, whitelist=None, after_ts=after_ts_wide)
 
 # Keep only top 15 valid tickers (Yahoo validated)
 if auto_discover and not sent_df.empty:
