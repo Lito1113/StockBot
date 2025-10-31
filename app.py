@@ -1,9 +1,10 @@
 # -----------------------------
 # Hotlist AI — Mobile (Streamlit, Pushshift edition)
-# Reddit-like data via PullPush (Pushshift mirror) + sentiment + technicals
+# Social buzz (Pushshift/PullPush) + VADER sentiment + RSI/SMA/Volume from Yahoo
+# No Reddit credentials required.
 # -----------------------------
 
-import os, re, time, math, datetime as dt
+import re, time, math, datetime as dt
 import requests
 import numpy as np
 import pandas as pd
@@ -43,31 +44,30 @@ def extract_tickers(text: str, whitelist):
     found = set(re.findall(TICKER_PATTERN, text.upper()))
     return [t for t in found if t in whitelist]
 
-def _pp_get(kind: str, params: dict):
-    """Small wrapper with sensible defaults and basic backoff."""
-    url = f"{PULLPUSH_BASE}/{kind}"
-    try:
-        r = requests.get(url, params=params, timeout=20)
-        if r.status_code != 200:
-            return []
-        j = r.json()
-        return j.get("data", [])
-    except Exception:
-        return []
+def http_get(url, params, timeout=20, retries=2, backoff=0.8):
+    """Small GET with retries/backoff."""
+    for i in range(retries + 1):
+        try:
+            r = requests.get(url, params=params, timeout=timeout)
+            if r.status_code == 200:
+                return r.json()
+        except Exception:
+            pass
+        time.sleep(backoff * (i + 1))
+    return None
 
 @st.cache_data(ttl=900)
 def pullpush_fetch_sub(subreddit: str, limit_total: int = 150):
     """
     Fetch recent submissions + comments text for a subreddit via PullPush.
-    Returns list of strings (title + body/comment).
+    Returns list[str] of text blobs.
     """
     texts = []
 
-    # Pull submissions (titles + selftext)
-    remaining = limit_total
-    size = min(100, remaining)
-    subs = _pp_get(
-        "submission",
+    # Submissions (titles + bodies)
+    size = min(100, max(1, limit_total))
+    res1 = http_get(
+        f"{PULLPUSH_BASE}/submission",
         {
             "subreddit": subreddit,
             "size": size,
@@ -76,17 +76,19 @@ def pullpush_fetch_sub(subreddit: str, limit_total: int = 150):
             "is_video": "false",
         },
     )
-    for s in subs:
-        title = s.get("title") or ""
-        body = s.get("selftext") or ""
-        texts.append(f"{title}\n{body}")
-    remaining -= len(subs)
+    if res1 and isinstance(res1.get("data"), list):
+        for s in res1["data"]:
+            title = s.get("title") or ""
+            body = s.get("selftext") or ""
+            if title or body:
+                texts.append(f"{title}\n{body}")
 
-    # Pull comments (if room)
-    if remaining > 0:
-        size = min(100, remaining)
-        coms = _pp_get(
-            "comment",
+    # Comments (a second batch up to remaining)
+    remain = max(0, limit_total - len(texts))
+    if remain:
+        size = min(100, remain)
+        res2 = http_get(
+            f"{PULLPUSH_BASE}/comment",
             {
                 "subreddit": subreddit,
                 "size": size,
@@ -94,9 +96,11 @@ def pullpush_fetch_sub(subreddit: str, limit_total: int = 150):
                 "sort": "desc",
             },
         )
-        for c in coms:
-            body = c.get("body") or ""
-            texts.append(body)
+        if res2 and isinstance(res2.get("data"), list):
+            for c in res2["data"]:
+                body = c.get("body") or ""
+                if body:
+                    texts.append(body)
 
     return texts
 
@@ -105,21 +109,24 @@ def scan_pushshift(subreddits, limit_per_sub, whitelist):
     """Return dataframe of mentions & sentiment by ticker using PullPush."""
     sid = SentimentIntensityAnalyzer()
     rows = []
-    for sub in subreddits:
+
+    # Progress bar
+    progress = st.progress(0)
+    total = max(1, len(subreddits))
+    for idx, sub in enumerate(subreddits, start=1):
         texts = pullpush_fetch_sub(sub, limit_total=limit_per_sub)
         if not texts:
             st.info(f"Skipping r/{sub} (no data returned from PullPush)")
-            continue
-
-        for t in texts:
-            tickers = extract_tickers(t, whitelist)
-            if not tickers:
-                continue
-            s = sid.polarity_scores(t)
-            for tk in tickers:
-                rows.append({"ticker": tk, **s})
-
-        time.sleep(0.2)  # be polite
+        else:
+            for t in texts:
+                tickers = extract_tickers(t, whitelist)
+                if not tickers:
+                    continue
+                s = sid.polarity_scores(t)
+                for tk in tickers:
+                    rows.append({"ticker": tk, **s})
+        progress.progress(idx / total)
+        time.sleep(0.1)
 
     if not rows:
         return pd.DataFrame(columns=["ticker","mentions","pos","neg","neu","compound"])
@@ -134,12 +141,23 @@ def scan_pushshift(subreddits, limit_per_sub, whitelist):
     ).reset_index()
     return agg.sort_values(["mentions","compound"], ascending=[False, False])
 
-@st.cache_data(ttl=900)
-def fetch_market_block(ticker, lookback_days=220):
-    end = dt.datetime.utcnow()
-    start = end - dt.timedelta(days=lookback_days)
-    data = yf.download(ticker, start=start.date(), end=end.date(), progress=False, auto_adjust=True)
-    if data.empty:
+def fetch_market_block(ticker, lookback_days=220, retries=1):
+    """RSI/SMA/volume snapshot with small retry."""
+    for i in range(retries + 1):
+        try:
+            end = dt.datetime.utcnow()
+            start = end - dt.timedelta(days=lookback_days)
+            data = yf.download(
+                ticker, start=start.date(), end=end.date(),
+                progress=False, auto_adjust=True, threads=False
+            )
+            if not data.empty:
+                break
+        except Exception:
+            pass
+        time.sleep(0.5 * (i + 1))
+
+    if data is None or data.empty:
         return None
 
     close = data["Close"]
@@ -174,33 +192,53 @@ def fetch_market_block(ticker, lookback_days=220):
 
 @st.cache_data(ttl=900)
 def enrich_with_market(sent_df, top_n=25):
+    """Safely enrich sentiment results with market data via yfinance."""
     if sent_df.empty:
         return sent_df
+
     tickers = list(sent_df["ticker"].head(top_n))
     market_rows = []
-    for t in tickers:
+
+    prog = st.progress(0)
+    total = max(1, len(tickers))
+    for i, t in enumerate(tickers, start=1):
         block = fetch_market_block(t)
         if block:
             market_rows.append({"ticker": t, **block})
-        time.sleep(0.1)  # small politeness delay
+        prog.progress(i / total)
+        time.sleep(0.05)
+
+    if not market_rows:
+        st.warning("No market data found for selected tickers (weekend/holiday/delisted?).")
+        return sent_df
+
     mdf = pd.DataFrame(market_rows)
-    return sent_df.merge(mdf, on="ticker", how="left")
+    if "ticker" not in sent_df.columns or "ticker" not in mdf.columns:
+        st.error("Ticker column missing in one of the dataframes.")
+        return sent_df
+
+    merged = pd.merge(sent_df, mdf, on="ticker", how="left", validate="1:1")
+    return merged
 
 def composite_score(row):
     comp = 0.0
-    s = (row.get("compound", 0) + 1) / 2            # sentiment (-1..1) -> 0..1
+    # sentiment (-1..1) -> 0..1
+    s = (row.get("compound", 0) + 1) / 2
     comp += 0.35 * s
 
-    rsi = row.get("rsi", np.nan)                    # momentum: RSI closeness to 50
+    # momentum: RSI closeness to 50
+    rsi = row.get("rsi", np.nan)
     if not np.isnan(rsi):
         comp += 0.30 * (1 - min(abs(rsi - 50), 50) / 50.0)
 
-    price, sma50 = row.get("price", np.nan), row.get("sma50", np.nan)  # trend: near SMA50
+    # trend: price near SMA50
+    price, sma50 = row.get("price", np.nan), row.get("sma50", np.nan)
     if not (np.isnan(price) or np.isnan(sma50) or sma50 == 0):
         dist = abs(price - sma50) / sma50
         comp += 0.20 * (1 - min(dist, 0.5) / 0.5)
 
-    vs = row.get("vol_spike", np.nan)               # volume spike (cap 3x)
+    # volume spike (cap 3x)
+    vs = row.get("vol_spike", np.nan)
     if not np.isnan(vs):
         comp += 0.15 * min(max(vs, 0), 3) / 3.0
 
@@ -235,7 +273,6 @@ st.caption("Pushshift (PullPush) + sentiment + technicals. No Reddit login neede
 
 with st.sidebar:
     st.header("Settings")
-
     subs_raw = st.text_input(
         "Subreddits (comma or space separated)",
         value=", ".join(DEFAULT_SUBREDDITS),
@@ -255,7 +292,7 @@ with st.sidebar:
     top_n = st.slider("Top N by mentions to enrich", 5, 50, 20, step=5)
 
     st.write("---")
-    st.write("Data source: PullPush (Pushshift mirror) public API. Market data: Yahoo Finance.")
+    st.write("Data source: PullPush (Pushshift mirror). Market data: Yahoo Finance.")
 
 if not whitelist:
     st.warning("Please provide at least one ticker in the whitelist.")
@@ -272,7 +309,6 @@ if sent_df.empty:
 st.subheader("Step 2 · Market enrichment")
 full = enrich_with_market(sent_df, top_n=top_n)
 if full.empty:
-    st.info("No market data resolved for the selected tickers.")
     st.stop()
 
 # Step 3: Scores + classifications
