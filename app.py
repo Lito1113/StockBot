@@ -1,7 +1,10 @@
-# Hotlist AI — Mobile (Reliable Reddit API version)
-# Official Reddit API (PRAW) -> auto-discover last-2-market-days top 15 tickers
-# + VADER sentiment + RSI/SMA/Volume (Yahoo) + composite ranking
+# ================================
+# Hotlist AI — Mobile (Reddit API)
+# ================================
+# Official Reddit API (PRAW) -> last-2-market-days -> auto-discover 15 tickers
+# + VADER sentiment + RSI/SMA/Volume (Yahoo) + composite ranking.
 
+# ---- core imports ----
 import os, re, time, datetime as dt
 from typing import List, Optional
 
@@ -11,48 +14,46 @@ import requests
 import streamlit as st
 import yfinance as yf
 
-try:
-    test_reddit = praw.Reddit(
-        client_id=st.secrets["reddit"]["client_id"],
-        client_secret=st.secrets["reddit"]["client_secret"],
-        user_agent=st.secrets["reddit"]["user_agent"],
-    )
-    test_post = next(test_reddit.subreddit("stocks").hot(limit=1))
-    st.sidebar.success(f"✅ Reddit connected: {test_post.title[:40]}...")
-except Exception as e:
-    st.sidebar.error(f"❌ Reddit auth failed: {e}")
-
-
-# --- Sentiment
+# ---- sentiment ----
 import nltk
 from nltk.sentiment.vader import SentimentIntensityAnalyzer
 
-# --- Reddit API
+# ---- reddit (PRAW) ----
 import praw
 from prawcore import RequestException, ResponseException, PrawcoreException
 
-# Bootstrap VADER lexicon once
+# ---- MUST be the first Streamlit call ----
+st.set_page_config(page_title="Hotlist AI — Mobile", page_icon="📈", layout="wide")
+
+# ===================
+# One-time NLTK setup
+# ===================
 try:
     nltk.data.find("sentiment/vader_lexicon.zip")
 except LookupError:
     nltk.download("vader_lexicon")
 
-# ------------------ Config ------------------
+# ==========
+# Constants
+# ==========
 DEFAULT_SUBS = ["stocks", "pennystocks", "themadinvestor", "TheRaceTo10Million"]
 TICKER_RE = re.compile(r"\b[A-Z]{2,5}\b")
 STOP_TICKER_WORDS = {
     "USD","CEO","DD","ATH","IPO","ETF","AI","YOLO","OTC","TOS","API",
     "GDP","CPI","FOMC","SEC","DTCC","RSI","SMA","EMA","EPS","PE","PEG"
 }
-REDDIT_HEADERS = {"User-Agent": st.secrets["reddit"]["user_agent"]}
+REDDIT_HEADERS = {"User-Agent": st.secrets["reddit"]["user_agent"]}  # also used for fallback
 
-# ------------- Time window helpers -------------
+# ===================
+# Time window helpers
+# ===================
 def start_of_earlier_of_last_two_bdays(tz="US/Eastern") -> int:
+    """00:00 of the earlier of last two business days (Mon–Fri)."""
     now_local = pd.Timestamp.now(tz).normalize()
     found = 0; day = 0; start = now_local
     while found < 2:
         d = now_local - pd.Timedelta(days=day)
-        if d.weekday() < 5:  # Mon–Fri
+        if d.weekday() < 5:
             start = d
             found += 1
         day += 1
@@ -61,7 +62,9 @@ def start_of_earlier_of_last_two_bdays(tz="US/Eastern") -> int:
 def five_days_ago_ts() -> int:
     return int((pd.Timestamp.utcnow() - pd.Timedelta(days=5)).timestamp())
 
-# ------------- Reddit client -------------
+# ================
+# Reddit utilities
+# ================
 def reddit_client() -> praw.Reddit:
     return praw.Reddit(
         client_id=st.secrets["reddit"]["client_id"],
@@ -70,7 +73,28 @@ def reddit_client() -> praw.Reddit:
         ratelimit_seconds=5,
     )
 
-# ------------- Extraction helpers -------------
+def reddit_public_json(subreddit: str, limit: int = 100) -> List[str]:
+    """Fallback: public JSON (submissions only)."""
+    texts = []
+    for feed in ("new", "hot"):
+        url = f"https://www.reddit.com/r/{subreddit}/{feed}.json"
+        try:
+            r = requests.get(url, params={"limit": min(100, max(1, limit))},
+                             headers=REDDIT_HEADERS, timeout=15)
+            if r.status_code != 200:
+                continue
+            children = (r.json().get("data") or {}).get("children") or []
+            for c in children:
+                d = c.get("data") or {}
+                title = d.get("title") or ""
+                body  = d.get("selftext") or ""
+                if title or body:
+                    texts.append(f"{title}\n{body}")
+            time.sleep(0.2)
+        except Exception:
+            pass
+    return texts
+
 def extract_tickers(text: str, whitelist: Optional[List[str]]) -> List[str]:
     if not text:
         return []
@@ -79,41 +103,16 @@ def extract_tickers(text: str, whitelist: Optional[List[str]]) -> List[str]:
         return [t for t in found if t not in STOP_TICKER_WORDS and 2 <= len(t) <= 5]
     return [t for t in found if t in whitelist]
 
-# ------------- Source fallback (last resort) -------------
-def reddit_public_json(subreddit: str, limit: int = 100) -> List[str]:
-    texts = []
-    for feed in ("new", "hot"):
-        url = f"https://www.reddit.com/r/{subreddit}/{feed}.json"
-        j = requests.get(url, params={"limit": min(100, max(1, limit))},
-                         headers=REDDIT_HEADERS, timeout=15)
-        if j.status_code != 200:
-            continue
-        data = j.json().get("data", {})
-        for c in data.get("children", []):
-            d = c.get("data", {})
-            title = d.get("title") or ""
-            body  = d.get("selftext") or ""
-            if title or body:
-                texts.append(f"{title}\n{body}")
-        time.sleep(0.2)
-    return texts
-
-# ------------- Collect posts & comments (PRAW) -------------
+# =================================
+# Fetch submissions + comments (API)
+# =================================
 @st.cache_data(ttl=900)
-def fetch_texts_for_sub(
-    sub: str,
-    after_ts: int,
-    per_sub_limit: int = 150
-) -> List[str]:
-    """
-    Use Reddit API to pull submissions (new) + comments since after_ts.
-    If nothing is returned (rare), fall back to public JSON for submissions.
-    """
+def fetch_texts_for_sub(sub: str, after_ts: int, per_sub_limit: int = 150) -> List[str]:
     rd = reddit_client()
     s = rd.subreddit(sub)
     texts: List[str] = []
 
-    # Submissions: stream newest and filter by created_utc
+    # submissions (new) filtered by time
     got = 0
     try:
         for post in s.new(limit=1000):
@@ -129,7 +128,7 @@ def fetch_texts_for_sub(
     except (RequestException, ResponseException, PrawcoreException):
         pass
 
-    # Comments: grab recent comments and filter by created_utc
+    # comments filtered by time
     got_c = 0
     try:
         for c in s.comments(limit=per_sub_limit):
@@ -144,13 +143,15 @@ def fetch_texts_for_sub(
     except (RequestException, ResponseException, PrawcoreException):
         pass
 
-    # If still empty, last resort: public JSON (submissions only)
+    # last-resort
     if not texts:
         texts = reddit_public_json(sub, limit=min(100, per_sub_limit))
 
     return texts
 
-# ------------- Scan + aggregate -------------
+# ==================
+# Scan + aggregation
+# ==================
 @st.cache_data(ttl=900)
 def scan_reddit(subs: List[str], after_ts: int, per_sub: int, whitelist=None) -> pd.DataFrame:
     sid = SentimentIntensityAnalyzer()
@@ -182,27 +183,26 @@ def scan_reddit(subs: List[str], after_ts: int, per_sub: int, whitelist=None) ->
     ).reset_index()
     return agg.sort_values(["mentions","compound"], ascending=[False, False])
 
-# ------------- Validation + markets -------------
+# ======================
+# Validation + markets
+# ======================
 @st.cache_data(ttl=900)
 def is_valid_symbol_yf(ticker: str) -> bool:
     try:
         end = dt.datetime.utcnow(); start = end - dt.timedelta(days=30)
-        df = yf.download(ticker, start=start.date(), end=end.date(), progress=False, auto_adjust=True, threads=False)
+        df = yf.download(ticker, start=start.date(), end=end.date(),
+                         progress=False, auto_adjust=True, threads=False)
         return not df.empty
     except Exception:
         return False
 
 def keep_top15_valid(sent_df: pd.DataFrame) -> pd.DataFrame:
-    if sent_df.empty:
-        return sent_df
+    if sent_df.empty: return sent_df
     picked = []
     for t in sent_df["ticker"]:
-        if t in picked: 
-            continue
-        if is_valid_symbol_yf(t):
-            picked.append(t)
-        if len(picked) >= 15:
-            break
+        if t in picked: continue
+        if is_valid_symbol_yf(t): picked.append(t)
+        if len(picked) >= 15: break
     return sent_df[sent_df["ticker"].isin(picked)].copy()
 
 def fetch_market_block(ticker, lookback_days=220, retries=1):
@@ -215,14 +215,17 @@ def fetch_market_block(ticker, lookback_days=220, retries=1):
             if not data.empty: break
         except Exception: pass
         time.sleep(0.5*(i+1))
-    if data is None or data.empty:
-        return None
+    if data is None or data.empty: return None
+
     close = data["Close"]; vol = data["Volume"]
     sma20  = close.rolling(20).mean()
     sma50  = close.rolling(50).mean()
     sma200 = close.rolling(200).mean()
-    delta = close.diff(); gain=(delta.clip(lower=0)).rolling(14).mean(); loss=(-delta.clip(upper=0)).rolling(14).mean()
-    rs = gain / loss; rsi = 100 - (100/(1+rs))
+    delta = close.diff()
+    gain  = (delta.clip(lower=0)).rolling(14).mean()
+    loss  = (-delta.clip(upper=0)).rolling(14).mean()
+    rs = gain / loss
+    rsi = 100 - (100/(1+rs))
     vol20 = vol.rolling(20).mean()
     last = data.iloc[-1]
     return {
@@ -239,28 +242,30 @@ def fetch_market_block(ticker, lookback_days=220, retries=1):
 @st.cache_data(ttl=900)
 def enrich_with_market(sent_df: pd.DataFrame, top_n=25) -> pd.DataFrame:
     if sent_df.empty: return sent_df
-    market_rows = []; prog = st.progress(0); tickers = list(sent_df["ticker"].head(top_n))
+    rows = []; prog = st.progress(0); tickers = list(sent_df["ticker"].head(top_n))
     for i,t in enumerate(tickers, start=1):
         blk = fetch_market_block(t)
-        if blk: market_rows.append({"ticker": t, **blk})
+        if blk: rows.append({"ticker": t, **blk})
         prog.progress(i/len(tickers)); time.sleep(0.05)
-    if not market_rows:
+    if not rows:
         st.warning("No market data found for selected tickers (weekend/holiday/delisted?).")
         return sent_df
-    mdf = pd.DataFrame(market_rows)
+    mdf = pd.DataFrame(rows)
     return pd.merge(sent_df, mdf, on="ticker", how="left", validate="1:1")
 
-# ------------- Scoring -------------
+# =========
+# Scoring
+# =========
 def composite_score(row):
     comp=0.0
-    comp += 0.35*((row.get("compound",0)+1)/2)   # sentiment
+    comp += 0.35*((row.get("compound",0)+1)/2)           # sentiment
     rsi=row.get("rsi", np.nan)
-    if not np.isnan(rsi): comp += 0.30*(1 - min(abs(rsi-50),50)/50)
+    if not np.isnan(rsi): comp += 0.30*(1 - min(abs(rsi-50),50)/50)  # momentum to 50
     price=row.get("price",np.nan); sma50=row.get("sma50",np.nan)
     if not (np.isnan(price) or np.isnan(sma50) or sma50==0):
-        comp += 0.20*(1 - min(abs(price-sma50)/sma50, 0.5)/0.5)
+        comp += 0.20*(1 - min(abs(price-sma50)/sma50, 0.5)/0.5)      # near SMA50
     vs=row.get("vol_spike",np.nan)
-    if not np.isnan(vs): comp += 0.15*min(max(vs,0),3)/3
+    if not np.isnan(vs): comp += 0.15*min(max(vs,0),3)/3             # volume spike (<=3x)
     return round(float(comp),4)
 
 def classify_zone(row):
@@ -278,46 +283,53 @@ def ai_decision(zone, comp_sent):
     if zone=="stretched" or comp_sent<-0.05: return "AVOID"
     return "HOLD"
 
-# ------------------ UI ------------------
-st.set_page_config(page_title="Hotlist AI — Mobile", page_icon="📈", layout="wide")
+# =========
+# UI
+# =========
 st.title("📈 Hotlist AI — Mobile")
-st.caption("Official Reddit API (reliable) → last-2-market-days → auto-discover 15 tickers → sentiment + technicals.")
+st.caption("Official Reddit API → last-2-market-days → auto-discover 15 tickers → sentiment + technicals.")
 
+# Sidebar: connection check + settings
 with st.sidebar:
+    try:
+        _test = reddit_client()
+        _title = next(_test.subreddit("stocks").hot(limit=1)).title
+        st.success(f"✅ Reddit connected: {_title[:40]}…")
+    except Exception as e:
+        st.error(f"❌ Reddit auth failed: {e}")
+
     st.header("Settings")
     subs_raw = st.text_input("Subreddits (comma/space separated)", value=", ".join(DEFAULT_SUBS))
     subs = [s.strip() for s in re.split(r"[,\s]+", subs_raw) if s.strip()]
-    limit_per = st.slider("Items per subreddit (posts + comments)", 50, 500, 150, step=25)
+    per_sub = st.slider("Items per subreddit (posts + comments)", 50, 500, 150, step=25)
     st.write("---")
     st.write("Data: Reddit API (PRAW). Fallback: reddit JSON. Market: Yahoo Finance.")
 
-# Step 1: Reddit scan (last 2 market days; widen to 5 days if truly empty)
+# Step 1: social scan
 st.subheader("Step 1 · Reddit scan")
 after_ts = start_of_earlier_of_last_two_bdays()
-sent_df = scan_reddit(subs, after_ts=after_ts, per_sub=limit_per, whitelist=None)
-if sent_df.empty:
+sent = scan_reddit(subs, after_ts=after_ts, per_sub=per_sub, whitelist=None)
+if sent.empty:
     st.info("No data in last 2 market days — widening to ~5 days…")
-    sent_df = scan_reddit(subs, after_ts=five_days_ago_ts(), per_sub=limit_per, whitelist=None)
+    sent = scan_reddit(subs, after_ts=five_days_ago_ts(), per_sub=per_sub, whitelist=None)
 
-# Keep top 15 valid tickers
-if not sent_df.empty:
-    sent_df = keep_top15_valid(sent_df)
+if not sent.empty:
+    sent = keep_top15_valid(sent)
+st.dataframe(sent, use_container_width=True)
+if sent.empty: st.stop()
 
-st.dataframe(sent_df, use_container_width=True)
-if sent_df.empty: st.stop()
-
-# Step 2: Market enrichment
+# Step 2: market enrichment
 st.subheader("Step 2 · Market enrichment")
-full = enrich_with_market(sent_df, top_n=25)
+full = enrich_with_market(sent, top_n=25)
 if full.empty: st.stop()
 
-# Step 3: Score + rank
+# Step 3: scoring + ranking
 full["Composite"] = full.apply(composite_score, axis=1)
 full["BuyZone"]   = full.apply(classify_zone, axis=1)
 full["AI_Decision"] = [ai_decision(z, c) for z,c in zip(full["BuyZone"], full["compound"].fillna(0.0))]
 
-cols = ["ticker","Composite","mentions","compound","rsi","vol_spike","price",
-        "change_d1_pct","sma20","sma50","sma200","BuyZone","AI_Decision"]
+cols = ["ticker","Composite","mentions","compound","rsi","vol_spike",
+        "price","change_d1_pct","sma20","sma50","sma200","BuyZone","AI_Decision"]
 table = full[[c for c in cols if c in full.columns]].sort_values("Composite", ascending=False).reset_index(drop=True)
 
 st.subheader("Step 3 · Ranked output")
@@ -325,7 +337,7 @@ st.dataframe(table, use_container_width=True)
 
 csv = table.to_csv(index=False).encode("utf-8")
 st.download_button("⬇️ Download CSV", csv,
-    file_name=f"hotlist_{dt.datetime.utcnow().strftime('%Y-%m-%d_%H%M')}.csv",
-    mime="text/csv")
+                   file_name=f"hotlist_{dt.datetime.utcnow().strftime('%Y-%m-%d_%H%M')}.csv",
+                   mime="text/csv")
 
 st.caption("Composite = sentiment (35%) + RSI-to-50 (30%) + price≈SMA50 (20%) + volume spike (15%).")
