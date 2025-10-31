@@ -11,6 +11,18 @@ import requests
 import streamlit as st
 import yfinance as yf
 
+try:
+    test_reddit = praw.Reddit(
+        client_id=st.secrets["reddit"]["client_id"],
+        client_secret=st.secrets["reddit"]["client_secret"],
+        user_agent=st.secrets["reddit"]["user_agent"],
+    )
+    test_post = next(test_reddit.subreddit("stocks").hot(limit=1))
+    st.sidebar.success(f"✅ Reddit connected: {test_post.title[:40]}...")
+except Exception as e:
+    st.sidebar.error(f"❌ Reddit auth failed: {e}")
+
+
 # --- Sentiment
 import nltk
 from nltk.sentiment.vader import SentimentIntensityAnalyzer
